@@ -1,0 +1,3 @@
+/home/humble/ceshi/realsense_demo/build-ort/CMakeFiles/diaoyongyolo.dir
+/home/humble/ceshi/realsense_demo/build-ort/CMakeFiles/edit_cache.dir
+/home/humble/ceshi/realsense_demo/build-ort/CMakeFiles/rebuild_cache.dir

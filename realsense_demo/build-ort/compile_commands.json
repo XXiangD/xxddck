@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/home/humble/ceshi/realsense_demo/build-ort",
+  "command": "/usr/bin/c++ -DELPP_NO_DEFAULT_LOG_FILE -isystem /usr/include/opencv4 -isystem /home/humble/onnxruntime-linux-x64-1.30.0/include -O2 -g -DNDEBUG -std=gnu++17 -o CMakeFiles/diaoyongyolo.dir/src/diaoyongyolo.cpp.o -c /home/humble/ceshi/realsense_demo/src/diaoyongyolo.cpp",
+  "file": "/home/humble/ceshi/realsense_demo/src/diaoyongyolo.cpp",
+  "output": "CMakeFiles/diaoyongyolo.dir/src/diaoyongyolo.cpp.o"
+}
+]
