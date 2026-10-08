@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/home/humble/project/realsense_demo/build-vscode",
+  "command": "/usr/bin/c++ -DELPP_NO_DEFAULT_LOG_FILE -I/home/humble/project/realsense_demo/include -isystem /usr/include/opencv4 -isystem /home/humble/onnxruntime-linux-x64-gpu_cuda13-1.30.0/include -std=gnu++17 -o CMakeFiles/diaoyongyolo.dir/src/diaoyongyolo.cpp.o -c /home/humble/project/realsense_demo/src/diaoyongyolo.cpp",
+  "file": "/home/humble/project/realsense_demo/src/diaoyongyolo.cpp",
+  "output": "CMakeFiles/diaoyongyolo.dir/src/diaoyongyolo.cpp.o"
+}
+]
