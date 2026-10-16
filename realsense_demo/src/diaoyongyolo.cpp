@@ -1,6 +1,5 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
-#include <librealsense2/rs.hpp>
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -15,6 +14,7 @@
 #include <condition_variable>
 #include <exception>
 #include <yuce.h>
+#include <preprocess.h>
 #include <librealsense2/rs.hpp>
 #include <librealsense2/rsutil.h>
 #include <cmath>
@@ -37,7 +37,7 @@ int runApplication(int argc, char **argv)
     sessionOptions.AppendExecutionProvider_CUDA(cudaOptions);
 
     // 模型路径
-    const std::string modelPath = "/home/humble/volleyball1/runs/detect/volleyball_m_project/5060_high_res-4/weights/best.onnx";
+    const std::string modelPath = "/home/project/modle/bestv26s.onnx";
 
     // 加载 ONNX 模型，创建一个可以执行推理的对象session
     // env：之前创建的 ONNX Runtime 环境，负责日志等运行基础设施。
@@ -70,13 +70,19 @@ int runApplication(int argc, char **argv)
 
     // 配置彩色数据流，参数含义为彩色图像，宽，高，按 蓝、绿、红(BGR) 排列的三个通道，每个通道 8 位,与OpenCV 常用的颜色顺序一致。每秒频率为30帧
     // enable_stream为启动数据流函数
-    config.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_BGR8, 30);
+    config.enable_stream(RS2_STREAM_COLOR, 640, 480, RS2_FORMAT_BGR8, 60);
 
     // 配置深度数据流,参数为深度图像,宽,高,每个通道16位,每秒频率30帧
-    config.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 30);
+    config.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16, 60);
 
     // 打开摄像头，应用 config 中设置的参数
-    pipeline.start(config);
+    auto profile = pipeline.start(config);
+
+    // 获取 RGB 彩色相机
+    auto color_sensor = profile.get_device().first<rs2::color_sensor>();
+
+    // 自动曝光
+    color_sensor.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 1.f);
 
     // 定义一个名为 frameMutex的互斥锁，用于协调采集线程和识别线程对共享数据的访问
     std::mutex frameMutex;
@@ -89,6 +95,19 @@ int runApplication(int argc, char **argv)
     bool hasNewFrame = false;
     bool stopCapture = false;
     std::exception_ptr captureError;
+
+    // 保存上一帧数据，并跳过第一次循环
+    yuce::Coordinate resultCopy{};
+    bool hasresultCopy = false;
+
+    //
+    std::vector<yuce::FrameVelocity> velocityData;
+    int frameIndex = 0; // 获取 CPU 内存中的图片地址
+
+    // 共享计数，所有读写都用 frameMutex 保护
+    std::uint64_t receivedCount = 0;
+    std::uint64_t processedCount = 0;
+    std::uint64_t overwrittenCount = 0;
 
     // 创建线程captureThread
     std::thread captureThread([&]()
@@ -151,6 +170,7 @@ int runApplication(int argc, char **argv)
 
     try
     {
+
         while (true)
         {
             rs2::frameset frames;
@@ -175,6 +195,9 @@ int runApplication(int argc, char **argv)
             rs2::video_frame colorFrame = alignedFrames.get_color_frame();
             rs2::depth_frame depthFrame = alignedFrames.get_depth_frame();
 
+            // 获取 CPU 内存中的图片地址
+            const void *cpuImage = colorFrame.get_data();
+
             if (!colorFrame || !depthFrame)
             {
                 std::cerr << "无法获取彩色图像\n";
@@ -196,7 +219,8 @@ int runApplication(int argc, char **argv)
             // 定义不可改变变量宽，高，置信度阈值
             const int inputWidth = 960;
             const int inputHeight = 960;
-            const float confidenceThreshold = 0.50f;
+            const float confidenceThreshold = 0.20f;
+            const float nmsThreshold = 0.45f; // 两个框的 IoU 超过此值时，抑制低分框
 
             // 等比例缩放并补边，避免把 640×480 直接拉伸为正方形
             const float scale = std::min(
@@ -267,55 +291,37 @@ int runApplication(int argc, char **argv)
             auto outputInfo = ortOutputs[0].GetTensorTypeAndShapeInfo();
             auto outputShape = outputInfo.GetShape();
 
-            int sizes[] = {1, 5, 18900};
+            const int count = static_cast<int>(outputShape[1]);
+            const float *raw =
+                ortOutputs[0].GetTensorData<float>();
 
-            cv::Mat outputView(
-                3,
-                sizes,
-                CV_32F,
-                ortOutputs[0].GetTensorMutableData<float>());
+            // 转换成后续代码使用的格式：
+            // centerX、centerY、width、height、score
+            cv::Mat predictions(count, 5, CV_32F);
 
-            // 当前循环内 ortOutputs 仍然有效，可以直接使用
-            cv::Mat output = outputView;
-
-            // 整理成每行一个候选框：
-            //  cx、cy、w、h、类别分数
-            cv::Mat predictions;
-
-            if (output.size[1] == 5 && output.size[2] != 5)
+            for (int i = 0; i < count; ++i)
             {
-                // 把模型输出的数据按二维矩阵查看
-                cv::Mat matrix(
-                    5,                  // 行数：5 项属性
-                    output.size[2],     // 列数：N 个候选框
-                    CV_32F,             // 每个元素是单通道 32 位浮点数
-                    output.ptr<float>() // 模型输出数据的起始地址
-                );
+                const float *detection = raw + i * 6;
+                float *row = predictions.ptr<float>(i);
 
-                // 转置矩阵
-                //  predictions 存放整理后的模型预测结果
-                cv::transpose(matrix, predictions);
-            }
-            else if (output.size[2] == 5 && output.size[1] != 5)
-            {
-                // [1, N, 5] → [N, 5]，无需转置
-                predictions = cv::Mat(
-                    output.size[1],     // 行数：N 个候选框
-                    5,                  // 列数：每个框的 5 项属性
-                    CV_32F,             // 元素类型：单通道 32 位浮点数
-                    output.ptr<float>() // 输出数据的起始地址
-                );
-            }
-            else
-            {
-                std::cerr << "输出形状不支持，或 [1, 5, 5] 的排列方向存在歧义\n";
-                return 1;
+                const float x1 = detection[0];
+                const float y1 = detection[1];
+                const float x2 = detection[2];
+                const float y2 = detection[3];
+
+                row[0] = (x1 + x2) * 0.5f;
+                row[1] = (y1 + y2) * 0.5f;
+                row[2] = x2 - x1;
+                row[3] = y2 - y1;
+                row[4] = detection[4];
             }
 
-            // 记录分数最高且达到置信度阈值的候选框编号
-            int bestIndex = -1;
-            // 记录当前最高分数
-            float bestScore = -1.0f;
+            // 收集达到置信度要求的候选框
+            std::vector<cv::Rect2d> candidateBoxes;
+            std::vector<float> candidateScores;
+
+            // 保存每个候选框在 predictions 中的原始行号
+            std::vector<int> candidateIndices;
 
             for (int i = 0; i < predictions.rows; ++i)
             {
@@ -334,15 +340,48 @@ int runApplication(int argc, char **argv)
                     !std::isfinite(height) ||
                     !std::isfinite(score) ||
                     width <= 0.0f ||
-                    height <= 0.0f)
+                    height <= 0.0f ||
+                    score < confidenceThreshold)
                 {
                     continue;
                 }
 
-                if (score >= confidenceThreshold && score > bestScore)
+                // 使用模型输入坐标进行 NMS，保留浮点精度
+                candidateBoxes.emplace_back(
+                    static_cast<double>(centerX) - width / 2.0,
+                    static_cast<double>(centerY) - height / 2.0,
+                    static_cast<double>(width),
+                    static_cast<double>(height));
+
+                candidateScores.push_back(score);
+                candidateIndices.push_back(i);
+            }
+
+            // NMS 返回的是 candidateBoxes 中的下标
+            std::vector<int> keptIndices;
+
+            if (!candidateBoxes.empty())
+            {
+                cv::dnn::NMSBoxes(
+                    candidateBoxes,
+                    candidateScores,
+                    confidenceThreshold,
+                    nmsThreshold,
+                    keptIndices);
+            }
+
+            // 从 NMS 保留的候选框中选择置信度最高的目标
+            int bestIndex = -1;
+            float bestScore = -1.0f;
+
+            for (int index : keptIndices)
+            {
+                if (candidateScores[index] > bestScore)
                 {
-                    bestScore = score;
-                    bestIndex = i;
+                    bestScore = candidateScores[index];
+
+                    // 转换回 predictions 的行号，供后续代码读取
+                    bestIndex = candidateIndices[index];
                 }
             }
 
@@ -439,18 +478,52 @@ int runApplication(int argc, char **argv)
                             static_cast<float>(pixelX),
                             static_cast<float>(pixelY)};
 
-                        float point[3] = {};
+                        float rawPoint[3] = {};
 
-                        rs2_deproject_pixel_to_point(point, &intrinsics, pixel, depthMeters);
+                        rs2_deproject_pixel_to_point(rawPoint, &intrinsics, pixel, depthMeters);
 
-                        point[0] = 1000*point[0];
-                        point[1] = 1000*point[1];
-                        point[2] = 1000*point[2];
+                        // 从米转换为毫米，存入坐标结构
+                        yuce::Coordinate point{};
+                        point.x = rawPoint[0] * 1000.0f;
+                        point.y = rawPoint[1] * 1000.0f;
+                        point.z = rawPoint[2] * 1000.0f;
 
-                        std::cout << "相机内部坐标：(" << point[0] << ", " << point[1] << "，" << point[2] << ")\n";
-                        yuce::Coordinate result = yuce::transformCoordinates(point[0],point[1], point[2], 0.5236);
-                        std::cout << "现实空间坐标：(" << result.x << ", " << result.y << "，" << result.z << ")\n";
+                        // std::cout << "相机内部坐标：(" << point.x << ", " << point.y << "，" << point.z << ")\n";
+                        yuce::Coordinate result = yuce::transformCoordinates(point.x, point.y, point.z, -0.3796);
+                        // std::cout << "现实空间坐标：(" << result.x << ", " << result.y << "，" << result.z << ")\n";
+
+                        if (hasresultCopy)
+                        {
+                            // 计算速度
+                            yuce::Coordinate velocity = yuce::calculateVelocity(resultCopy, result, 16.67);
+                            std::cout << "现实空间速度mm/ms：(" << velocity.x << ", " << velocity.y << "，" << velocity.z << ")\n";
+
+                            // 保存当前帧速度
+                            velocityData.push_back({frameIndex, velocity});
+
+                            // 收集20帧速度后，计算这段时间的平均加速度
+                            if (velocityData.size() == 30)
+                            {
+                                const yuce::FrameAcceleration acceleration = yuce::calculateAcceleration(velocityData, 16.67);
+
+                                std::cout << "平均加速度mm/ms²：(" << acceleration.ax << ", " << 1000 * acceleration.ay << ", " << acceleration.az << ")\n";
+
+                                if (acceleration.ay * 1000 >= 9)
+                                {
+
+                                    std::cout << "yes\n";
+                                }
+
+                                // 保留19帧，下一帧到来后继续更新
+                                velocityData.erase(velocityData.begin());
+                            }
+                        }
+
+                        // 计算完速度后保存，供下一帧使用
+                        resultCopy = result;
+                        hasresultCopy = true;
                     }
+
                     // 把深度文字追加到 label 后面
                     label += depthLabel;
 

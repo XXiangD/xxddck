@@ -1,0 +1,14 @@
+# 忽略根目录所有内容
+/*
+
+# 保留 .gitignore
+!/.gitignore
+
+# 允许进入 realsense_demo，但先忽略其所有内容
+!/realsense_demo/
+/realsense_demo/*
+
+# 保留指定目录和文件
+!/realsense_demo/include/
+!/realsense_demo/src/
+!/realsense_demo/README.md
