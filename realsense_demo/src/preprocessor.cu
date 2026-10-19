@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <stdlib.h>
-#include "preprocess.h"
+#include "preprocessor.h"
 #include <algorithm>
 #include <cmath>
 
@@ -126,9 +126,11 @@ __global__ void preprocessKernel(
         const int y1 =
             y0 + 1 < height ? y0 + 1 : height - 1;
 
+        //相对于左上角像素 (x0, y0) 的偏移量
         const float dx = sx - x0;
         const float dy = sy - y0;
 
+        //四个像素的颜色权重
         const float w00 = (1.0f - dx) * (1.0f - dy);
         const float w01 = dx * (1.0f - dy);
         const float w10 = (1.0f - dx) * dy;

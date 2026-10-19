@@ -14,10 +14,66 @@
 #include <condition_variable>
 #include <exception>
 #include <yuce.h>
-#include <preprocess.h>
+#include <preprocessor.h>
 #include <librealsense2/rs.hpp>
 #include <librealsense2/rsutil.h>
 #include <cmath>
+
+// CUDA 调用失败时抛出异常，交给现有异常处理代码处理。
+static void checkCuda(cudaError_t error, const char *operation)
+{
+    if (error != cudaSuccess)
+    {
+        throw std::runtime_error(
+            std::string(operation) + ": " + cudaGetErrorString(error));
+    }
+}
+
+// 自动释放显存，正常退出和异常退出都会执行。
+struct GpuBuffers
+{
+    unsigned char *image = nullptr;
+    float *input = nullptr;
+
+    int imageWidth = 0;
+    int imageHeight = 0;
+
+    GpuBuffers() = default;
+    GpuBuffers(const GpuBuffers &) = delete;
+    GpuBuffers &operator=(const GpuBuffers &) = delete;
+
+    ~GpuBuffers()
+    {
+        if (input)
+            cudaFree(input);
+
+        if (image)
+            cudaFree(image);
+    }
+
+    // 第一帧分配原图显存；尺寸不变时重复使用。
+    void ensureImageSize(int width, int height)
+    {
+        if (image &&
+            width == imageWidth &&
+            height == imageHeight)
+        {
+            return;
+        }
+
+        unsigned char *newImage = nullptr;
+        checkCuda(
+            allocateImage(&newImage, width, height),
+            "allocateImage");
+
+        if (image)
+            cudaFree(image);
+
+        image = newImage;
+        imageWidth = width;
+        imageHeight = height;
+    }
+};
 
 int runApplication(int argc, char **argv)
 {
@@ -55,10 +111,42 @@ int runApplication(int argc, char **argv)
     const char *inputNames[] = {inputName.get()};
     const char *outputNames[] = {outputName.get()};
 
-    // 输入数据放在 CPU 内存中，不代表模型仍然使用 CPU 推理。启用 CUDA 后，ONNX Runtime 会处理需要的数据传输。
-    Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(
-        OrtArenaAllocator,
+    // 与 CUDA Execution Provider 使用同一块 GPU。
+    checkCuda(cudaSetDevice(0), "cudaSetDevice");
+
+    const int inputWidth = 960;
+    const int inputHeight = 960;
+
+    const float confidenceThreshold = 0.20f;
+    const float nmsThreshold = 0.45f;
+
+    // 显存放在循环外，重复使用。
+    // 放在采集线程创建之前，避免分配失败时留下未 join 的线程。
+    GpuBuffers gpu;
+
+    checkCuda(
+        allocateInput(&gpu.input, inputWidth, inputHeight),
+        "allocateInput");
+
+    Ort::MemoryInfo cudaMemoryInfo(
+        "Cuda",
+        OrtDeviceAllocator,
+        0,
         OrtMemTypeDefault);
+
+    std::array<int64_t, 4> inputShape = {
+        1, 3, inputHeight, inputWidth};
+
+    const size_t inputElementCount =
+        static_cast<size_t>(3) * inputHeight * inputWidth;
+
+    // 这个张量引用 gpu.input，不复制数据，也不负责释放该显存。
+    Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
+        cudaMemoryInfo,
+        gpu.input,
+        inputElementCount,
+        inputShape.data(),
+        inputShape.size());
 
     // 启动 RealSense 相机并获取一帧彩色图像
     // 配置 D435i 的彩色流和深度流
@@ -195,9 +283,6 @@ int runApplication(int argc, char **argv)
             rs2::video_frame colorFrame = alignedFrames.get_color_frame();
             rs2::depth_frame depthFrame = alignedFrames.get_depth_frame();
 
-            // 获取 CPU 内存中的图片地址
-            const void *cpuImage = colorFrame.get_data();
-
             if (!colorFrame || !depthFrame)
             {
                 std::cerr << "无法获取彩色图像\n";
@@ -216,71 +301,44 @@ int runApplication(int argc, char **argv)
 
             image = image.clone();
 
-            // 定义不可改变变量宽，高，置信度阈值
-            const int inputWidth = 960;
-            const int inputHeight = 960;
-            const float confidenceThreshold = 0.20f;
-            const float nmsThreshold = 0.45f; // 两个框的 IoU 超过此值时，抑制低分框
+            // 原图尺寸没有变化时，不会重复分配显存。
+            gpu.ensureImageSize(
+                colorFrame.get_width(),
+                colorFrame.get_height());
 
-            // 等比例缩放并补边，避免把 640×480 直接拉伸为正方形
-            const float scale = std::min(
-                inputWidth / static_cast<float>(image.cols),
-                inputHeight / static_cast<float>(image.rows));
+            // 上传原始 BGR 图像。
+            // 使用 RealSense 实际的行跨度，兼容行尾填充。
+            checkCuda(
+                uploadImage(
+                    gpu.image,
+                    static_cast<const unsigned char *>(colorFrame.get_data()),
+                    colorFrame.get_width(),
+                    colorFrame.get_height(),
+                    static_cast<size_t>(colorFrame.get_stride_in_bytes())),
+                "uploadImage");
 
-            const int resizedWidth = static_cast<int>(
-                std::round(image.cols * scale));
-            const int resizedHeight = static_cast<int>(
-                std::round(image.rows * scale));
+            // 后面坐标还原仍然需要这三个参数。
+            float scale = 1.0f;
+            int padLeft = 0;
+            int padTop = 0;
 
-            cv::Mat resized;
-            cv::resize(image, resized, cv::Size(resizedWidth, resizedHeight));
+            // GPU 完成缩放、补边、BGR→RGB、归一化、HWC→CHW。
+            checkCuda(
+                preprocessImage(
+                    gpu.image,
+                    colorFrame.get_width(),
+                    colorFrame.get_height(),
+                    gpu.input,
+                    inputWidth,
+                    inputHeight,
+                    scale,
+                    padLeft,
+                    padTop),
+                "preprocessImage");
 
-            // 计算补充画布
-            const int padLeft = (inputWidth - resizedWidth) / 2;
-            const int padTop = (inputHeight - resizedHeight) / 2;
-
-            // 完整画布
-            cv::Mat padded(
-                inputHeight, inputWidth, CV_8UC3,
-                cv::Scalar(114, 114, 114));
-
-            // 把缩放后的图像 resized，复制到画布 padded 的指定区域
-            resized.copyTo(
-                padded(cv::Rect(padLeft, padTop, resizedWidth, resizedHeight)));
-
-            // 转为模型输入：
-            //  像素除以 255；BGR 转 RGB；生成 [1, 3, 640, 640] 的张量
-            // cv::dnn::blobFromImage() 用于把 OpenCV 图像转换为神经网络需要的输入张量
-            // cv::Scalar() 创建一个各分量都为 0 的标量对象
-            cv::Mat blob = cv::dnn::blobFromImage(
-                padded,
-                1.0 / 255.0,
-                cv::Size(inputWidth, inputHeight),
-                cv::Scalar(), // 各通道减去的均值，这里为 0
-                true,         // swapRB：BGR 转 RGB
-                false         // 不裁剪
-            );
-
-            // blob 已经是 float32，形状为 [1, 3, 960, 960]
-            // blob.isContinuous()：检查 OpenCV 的 cv::Mat 数据是否连续存放
-            if (!blob.isContinuous())
-            {
-                blob = blob.clone();
-            }
-
-            std::array<int64_t, 4> inputShape = {1, 3, inputHeight, inputWidth};
-
-            // 将 OpenCV 的 blob 内存包装为 ONNX Runtime 输入
-            Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
-                memoryInfo,
-                blob.ptr<float>(),
-                blob.total(),
-                inputShape.data(),
-                inputShape.size());
-
-            // 执行推理
+            // inputTensor 已经在循环外创建，引用的就是 gpu.input。
             auto ortOutputs = session.Run(
-                Ort::RunOptions{nullptr}, // 使用默认运行选项
+                Ort::RunOptions{nullptr},
                 inputNames,
                 &inputTensor,
                 1,
