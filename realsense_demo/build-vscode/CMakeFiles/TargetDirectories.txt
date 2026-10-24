@@ -1,3 +1,0 @@
-/home/humble/project/realsense_demo/build-vscode/CMakeFiles/diaoyongyolo.dir
-/home/humble/project/realsense_demo/build-vscode/CMakeFiles/edit_cache.dir
-/home/humble/project/realsense_demo/build-vscode/CMakeFiles/rebuild_cache.dir
