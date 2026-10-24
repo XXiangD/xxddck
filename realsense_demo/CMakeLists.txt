@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 3.16)
-project(d435i_demo LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.18)
+project(d435i_demo LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(realsense2 REQUIRED)
 find_package(Threads REQUIRED)
+
 
 find_package(OpenCV REQUIRED COMPONENTS
     core
@@ -49,23 +50,31 @@ set_target_properties(onnxruntime PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_ROOT}/include"
 )
 
-add_executable(diaoyongyolo src/diaoyongyolo.cpp)
+add_executable(main src/
+    src/main.cpp
+    src/preprocessor.cu
+    src/post-processing.cu
+)
 
-target_include_directories(diaoyongyolo PRIVATE
+
+find_package(CUDAToolkit REQUIRED)
+
+target_include_directories(main PRIVATE
     ${OpenCV_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-target_link_libraries(diaoyongyolo PRIVATE
+target_link_libraries(main PRIVATE
     realsense2::realsense2
     ${OpenCV_LIBS}
     onnxruntime
     Threads::Threads
+    CUDA::cudart
 )
 
-set_target_properties(diaoyongyolo PROPERTIES
+set_target_properties(main PROPERTIES
     BUILD_RPATH "${ONNXRUNTIME_ROOT}/lib;${CUDA_RUNTIME_LIB_DIR};${CUDNN_LIB_DIR}"
 )
 # CUDA provider 是动态加载的，使用可传递的 RPATH 查找其间接依赖。
-target_link_options(diaoyongyolo PRIVATE "LINKER:--disable-new-dtags"
+target_link_options(main PRIVATE "LINKER:--disable-new-dtags"
 )

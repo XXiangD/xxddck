@@ -56,7 +56,7 @@ cudaError_t uploadImage(
     return cudaMemcpy2D(
         gpuImage,                 // 目标：GPU 显存
         rowBytes,                 // GPU 每行字节数
-        cpuImage,                 // 来源：CPU 图像
+        cpuImage,                 // 来源：CPU 图像00
         cpuStride,                // CPU 每行实际字节数
         rowBytes,                 // 每行复制多少字节
         height,                   // 复制多少行
