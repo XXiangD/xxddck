@@ -301,7 +301,7 @@ __global__ void restoreTargetCoordinatesKernel(
     box.valid = box.x2 > box.x1 && box.y2 > box.y1;
 }
 
-// 启动核函数，选择置信度最高的有效框
+// 启动核函数，将选中框从模型输入坐标还原到原图坐标
 cudaError_t restoreTargetCoordinates(
     Detection *selected,
     float scale,
